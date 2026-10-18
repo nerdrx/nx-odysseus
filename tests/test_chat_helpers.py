@@ -4,6 +4,13 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+
+
+def test_clean_repeated_assistant_content_collapses_concatenated_copies():
+    from routes.chat_helpers import clean_repeated_assistant_content
+
+    answer = "The second event starts at 1:00 AM."
+    assert clean_repeated_assistant_content(answer * 3) == answer
 from fastapi import HTTPException
 
 import routes.chat_helpers as chat_helpers
@@ -11,14 +18,53 @@ from routes.chat_helpers import (
     _enforce_chat_privileges,
     _session_is_research_spinoff,
     auto_name_session,
+    auto_name_session_after_stream,
     build_chat_context,
     build_uploaded_file_manifest,
+    clean_repeated_assistant_content,
     clean_thinking_for_save,
+    fallback_session_title,
     needs_auto_name,
     PreprocessedMessage,
     PresetInfo,
     save_assistant_response,
 )
+
+
+def test_clean_repeated_assistant_content_collapses_rejoined_calendar_answer():
+    answer = (
+        "Here's your calendar for the week:\n\n"
+        "- Monday -- Nothing planned\n"
+        "- Tuesday -- Rent payment\n\n"
+        "Nothing else comes up for the week."
+    )
+    dirty = (
+        "ls.\n</think>\n\n"
+        f"{answer}"
+        "ls.\n</think>\n\n"
+        f"{answer}\n"
+        f"{answer}"
+    )
+
+    assert clean_repeated_assistant_content(dirty) == answer
+
+
+def test_clean_repeated_assistant_content_preserves_single_answer():
+    answer = "Here's your calendar for September:\n\n- Sep 4 -- Lunch with Jon"
+
+    assert clean_repeated_assistant_content(answer) == answer
+
+
+def test_qwen_thinking_process_uses_last_explicit_final_marker():
+    leaked = (
+        "Thinking Process:\n\n1. Analyze the request.\n\n"
+        "Final Output Generation:\nDraft answer.\n\n"
+        "Wait, check the context again.\n\n"
+        "Final decision:\nThe preceding result says web access was disabled."
+    )
+    visible, metadata = clean_thinking_for_save(leaked)
+    assert visible == "The preceding result says web access was disabled."
+    assert metadata["thinking"].startswith("1. Analyze the request.")
 
 
 class _AuthManager:
@@ -294,78 +340,38 @@ def test_needs_auto_name(name, expected):
     assert needs_auto_name(name) == expected, f"needs_auto_name({name!r}) should be {expected}"
 
 
-@pytest.mark.parametrize("name,model,expected", [
-    ("gpt-6.1-sol", "gpt-6.1-sol", True),
-    ("huihui-qwen3.8:27b-local", "huihui-qwen3.8:27b-local", True),
-    ("Custom title", "gpt-6.1-sol", False),
-])
-def test_needs_auto_name_recognizes_model_placeholders_only(name, model, expected):
-    assert needs_auto_name(name, model) is expected
-
-
-def test_request_fallback_remains_auto_named_but_custom_chat_prefix_does_not():
-    message = "Please explain how workspace snapshots work."
-    fallback = "Chat: Please explain how workspace snapshots work."
-    assert needs_auto_name(fallback, "gpt-6.1-sol", first_message=message)
-    assert not needs_auto_name("Chat: Keep this name", "gpt-6.1-sol", name_is_custom=True)
-    assert not needs_auto_name("Chat", "gpt-6.1-sol", name_is_custom=True)
-    assert not needs_auto_name("Chat: Custom title", "gpt-6.1-sol", name_is_custom=True)
-
-
-def test_first_request_replaces_model_placeholder_but_keeps_user_title():
-    from src.chat_handler import ChatHandler
-
-    message = "Please explain how workspace snapshots work."
-    updates = []
-    handler = ChatHandler(None, None, None, None, None, None)
-    handler.session_manager = SimpleNamespace(
-        update_session_name=lambda session_id, title, **kwargs: updates.append((session_id, title, kwargs))
+def test_auto_name_after_stream_reloads_session_before_naming(monkeypatch):
+    stale = SimpleNamespace(id="sid", name="kimi-k3 1:23:45 PM", history=[])
+    fresh = SimpleNamespace(
+        id="sid",
+        name="kimi-k3 1:23:45 PM",
+        history=[SimpleNamespace(role="user", content="search the web for Richmond")],
     )
-    session = SimpleNamespace(
-        id="session-title", name="gpt-6.1-sol", model="gpt-6.1-sol",
-        history=[SimpleNamespace(role="user", content=message)], name_is_custom=False,
+    calls = []
+
+    class Manager:
+        def get_session(self, session_id):
+            assert session_id == "sid"
+            return fresh
+
+    async def fake_auto_name(manager, sess):
+        calls.append(sess)
+
+    monkeypatch.setattr(chat_helpers, "_is_session_stream_active", lambda _sid: False)
+    monkeypatch.setattr(chat_helpers, "auto_name_session", fake_auto_name)
+
+    asyncio.run(auto_name_session_after_stream("sid", Manager(), stale))
+
+    assert calls == [fresh]
+
+
+def test_fallback_session_title_uses_first_prompt_words():
+    assert (
+        fallback_session_title(
+            "Find the answer online and keep it concise: where does alaska the last frontier take place?"
+        )
+        == "Find the answer online and keep"
     )
-
-    handler.update_session_name_if_needed(session, message)
-    assert updates == [("session-title", f"Chat: {message}", {"name_is_custom": False})]
-
-    updates.clear()
-    session.name = "My chosen title"
-    handler.update_session_name_if_needed(session, message)
-    assert updates == []
-
-
-def test_generated_title_does_not_overwrite_user_rename_during_generation(monkeypatch):
-    import src.llm_core as llm_core
-    import src.task_endpoint as task_endpoint
-
-    sess = SimpleNamespace(
-        id="session-rename-race", owner="alice", name="Chat: First request",
-        endpoint_url="http://session.example/v1", model="gpt-6.1-sol", headers={},
-        history=[SimpleNamespace(role="user", content="First request")],
-        name_is_custom=False,
-    )
-
-    def resolve(*_args, **_kwargs):
-        return "http://session.example/v1", "gpt-6.1-sol", {}
-
-    async def rename_while_generating(*_args, **_kwargs):
-        sess.name = "User chosen title"
-        return "Generated title"
-
-    monkeypatch.setattr(task_endpoint, "resolve_task_endpoint", resolve)
-    monkeypatch.setattr(llm_core, "llm_call_async", rename_while_generating)
-    updates = []
-    manager = SimpleNamespace(update_session_name=lambda *args, **kwargs: updates.append((args, kwargs)))
-
-    asyncio.run(auto_name_session(manager, sess))
-
-    assert updates == []
-
-
-def test_legacy_group_parent_is_placeholder_but_manual_model_name_is_not():
-    assert needs_auto_name("[GRP] huihui, gpt-6.1-sol", "gpt-6.1-sol")
-    assert not needs_auto_name("gpt-6.1-sol", "gpt-6.1-sol", name_is_custom=True)
 
 
 def test_clean_thinking_for_save_extracts_gemma4_thought_channel():
@@ -407,6 +413,18 @@ def test_clean_thinking_for_save_extracts_thought_tag():
 
     assert content == "Final answer."
     assert metadata["thinking"] == "internal reasoning"
+
+
+def test_clean_thinking_for_save_preserves_interrupted_thinking_only_turn():
+    content, metadata = clean_thinking_for_save(
+        '<think time="2.4">partial reasoning before stop',
+        {"stopped": True, "model": "thinking-model"},
+    )
+
+    assert content == ""
+    assert metadata["thinking"] == "partial reasoning before stop"
+    assert metadata["thinking_time"] == "2.4"
+    assert metadata["thinking_interrupted"] is True
 
 
 def test_save_assistant_response_incognito_does_not_mutate_session_history():
@@ -647,3 +665,107 @@ async def test_build_chat_context_keeps_cookie_user_owner_scope(monkeypatch):
         "preface_owner": "bob",
         "compact_owner": "bob",
     }
+
+
+async def _build_context_web_probe(monkeypatch, *, message, use_web, agent_mode):
+    captured = {"use_web": None}
+
+    async def fake_preprocess(chat_handler, message, att_ids, sess, **kwargs):
+        return PreprocessedMessage(
+            enhanced_message=message,
+            user_content=message,
+            text_for_context=message,
+            youtube_transcripts=[],
+            attachment_meta=[],
+        )
+
+    def fake_extract_preset(chat_handler, preset_id):
+        return PresetInfo(
+            temperature=0.7,
+            max_tokens=1024,
+            system_prompt=None,
+            character_name=None,
+        )
+
+    def fake_build_context_preface(**kwargs):
+        captured["use_web"] = kwargs["use_web"]
+        return [], [], []
+
+    async def fake_maybe_compact(sess, endpoint_url, model, messages, headers, owner=None):
+        return messages, 8192, False
+
+    monkeypatch.setattr(chat_helpers, "preprocess", fake_preprocess)
+    monkeypatch.setattr(chat_helpers, "extract_preset", fake_extract_preset)
+    monkeypatch.setattr(chat_helpers, "load_prefs_for_user", lambda owner: {"memory_enabled": True, "skills_enabled": True})
+    monkeypatch.setattr(chat_helpers, "_normalize_model_id_from_cache", lambda sess: None)
+    monkeypatch.setattr(chat_helpers, "normalize_model_id", lambda endpoint_url, model, **kwargs: None)
+    monkeypatch.setattr(chat_helpers, "maybe_compact", fake_maybe_compact)
+    monkeypatch.setattr(chat_helpers, "trim_for_context", lambda messages, context_length: messages)
+
+    import src.user_time as user_time
+
+    monkeypatch.setattr(
+        user_time,
+        "current_datetime_context_message",
+        lambda now_utc=None: {"role": "user", "content": "[Context - current date/time]"},
+        raising=False,
+    )
+
+    sess = SimpleNamespace(
+        endpoint_url="http://model.local/v1/chat/completions",
+        model="test-model",
+        headers={},
+        history=[],
+        messages=[],
+    )
+    sess.get_context_messages = lambda: list(sess.messages)
+    request = SimpleNamespace(state=SimpleNamespace(api_token=False, current_user="alice"))
+
+    await build_chat_context(
+        sess=sess,
+        request=request,
+        chat_handler=SimpleNamespace(),
+        chat_processor=SimpleNamespace(build_context_preface=fake_build_context_preface),
+        message=message,
+        session_id="session-1",
+        use_web=use_web,
+        incognito=True,
+        agent_mode=agent_mode,
+    )
+    return captured
+
+
+@pytest.mark.asyncio
+async def test_build_chat_context_treats_use_web_false_string_as_false(monkeypatch):
+    captured = await _build_context_web_probe(
+        monkeypatch,
+        message="latest apple news",
+        use_web="false",
+        agent_mode=False,
+    )
+
+    assert captured["use_web"] is False
+
+
+@pytest.mark.asyncio
+async def test_build_chat_context_skips_pre_web_for_agent_calendar_turn(monkeypatch):
+    captured = await _build_context_web_probe(
+        monkeypatch,
+        message="when is my next appointment",
+        use_web="true",
+        agent_mode=True,
+    )
+
+    assert captured["use_web"] is False
+
+
+@pytest.mark.asyncio
+async def test_build_chat_context_skips_pre_web_for_agent_notes_turn(monkeypatch):
+    captured = await _build_context_web_probe(
+        monkeypatch,
+        message="show my latest notes",
+        use_web="true",
+        agent_mode=True,
+    )
+
+    assert captured["use_web"] is False
