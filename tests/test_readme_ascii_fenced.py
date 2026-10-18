@@ -1,4 +1,8 @@
-"""Keep the fork title recognizable and any ASCII banner fenced."""
+"""Regression guard for the README title presentation.
+
+The original ASCII-art banner needed a code fence to preserve whitespace.
+Keep the wordmark title identity and the historical ASCII-fencing guard.
+"""
 from pathlib import Path
 
 README = Path(__file__).resolve().parent.parent / "README.md"
@@ -14,9 +18,9 @@ def _fenced_segments(text: str):
     return parts[1::2]
 
 
-def test_readme_opens_with_fork_title():
-    first_line = README.read_text(encoding="utf-8").splitlines()[0]
-    assert first_line == "# NX Odysseus"
+def test_readme_opens_with_wordmark_title():
+    head = "\n".join(README.read_text(encoding="utf-8").splitlines()[:15])
+    assert 'alt="Odysseus"' in head, "README must open with the Odysseus wordmark image"
 
 
 def test_reintroduced_ascii_banner_stays_fenced():

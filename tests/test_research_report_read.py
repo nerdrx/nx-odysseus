@@ -20,15 +20,14 @@ import pytest
 from src.tool_implementations import do_manage_research
 from src.agent_loop import TOOL_SECTIONS
 
+
 @pytest.fixture
 def saved_report(tmp_path, monkeypatch):
-    import src.tools.research as research
+    from src.tools import research
 
-    data_dir = tmp_path / "deep_research"
-    data_dir.mkdir()
-    monkeypatch.setattr(research, "DEEP_RESEARCH_DIR", str(data_dir))
+    monkeypatch.setattr(research, "DEEP_RESEARCH_DIR", str(tmp_path))
     rid = "rp-testreport1363"
-    path = data_dir / f"{rid}.json"
+    path = tmp_path / f"{rid}.json"
     path.write_text(json.dumps({
         "query": "trending blender video ideas",
         "result": "## Findings\nShort-form Geometry Nodes tutorials are trending.",

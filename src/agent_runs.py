@@ -30,11 +30,7 @@ logger = logging.getLogger(__name__)
 
 
 class _Run:
-    __slots__ = (
-        "buffer", "subscribers", "status", "task", "evict_task", "run_id", "owner",
-        "checkpoint_pending", "checkpoint_last_flush", "persist_checkpoint", "drain_started",
-        "deleted_scope", "predecessor_task", "stop_requested",
-    )
+    __slots__ = ("buffer", "subscribers", "status", "task", "evict_task", "run_id", "finish_requested", "finish_event")
 
     def __init__(self, owner: Optional[str] = None, persist_checkpoint: bool = True,
                  predecessor_task: Optional[asyncio.Task] = None) -> None:
@@ -46,16 +42,8 @@ class _Run:
         # Stable across every subscription/replay of this exact detached run.
         # The browser uses it to make local cost accounting replay-idempotent.
         self.run_id: str = uuid.uuid4().hex
-        self.owner = owner
-        self.checkpoint_pending = ""
-        self.checkpoint_last_flush = 0.0
-        self.persist_checkpoint = persist_checkpoint
-        self.drain_started = False
-        self.deleted_scope: Optional[tuple[str, str]] = None
-        self.stop_requested = False
-        # If this run is replaced before _drain starts, its own task cannot
-        # carry the predecessor barrier onward, so the next run inherits it.
-        self.predecessor_task = predecessor_task
+        self.finish_requested: bool = False
+        self.finish_event = asyncio.Event()
 
 
 _RUNS: Dict[str, _Run] = {}
@@ -204,21 +192,20 @@ async def _drain(session_id: str, run: _Run, agen: AsyncGenerator[str, None],
     try:
         if prev_task is not None and not prev_task.done():
             await asyncio.wait({prev_task})
+        terminal_event: Optional[str] = None
         async for ev in agen:
-            if run.persist_checkpoint:
-                change = run_checkpoints.checkpoint_event(ev)
-                if "output_delta" in change:
-                    run.checkpoint_pending = (
-                        run.checkpoint_pending + change["output_delta"]
-                    )[-32_000:]
-                    if time.monotonic() - run.checkpoint_last_flush >= 0.5:
-                        _flush_checkpoint_delta(run)
-                elif "pending_tool" in change or "tool_outcome" in change:
-                    _flush_checkpoint_delta(run)
-                    run_checkpoints.record(run.run_id, ev)
+            # A client treats [DONE] as permission to submit the next turn.
+            # Do not expose it until the wrapped generator has fully unwound;
+            # chat persistence and active-run cleanup can occur after the
+            # generator yields its terminal SSE event.
+            if str(ev).strip() == "data: [DONE]":
+                terminal_event = ev
+                continue
             _publish(run, ev)
         if run.status == "running":
             run.status = "done"
+        if terminal_event is not None:
+            _publish(run, terminal_event)
     except asyncio.CancelledError:
         # Explicit stop/replacement paths mark the run terminal before they
         # cancel it. A cancellation that arrives first has no user intent
@@ -443,72 +430,23 @@ def stop(session_id: str, expected_run_id: Optional[str] = None) -> bool:
     return False
 
 
-def fence_deleted_session(session_id: str, owner: Optional[str]) -> bool:
-    """Fence tool archives and stop a live run before its session is removed."""
-    with _RUN_LOCK:
-        run = _RUNS.get(session_id)
-        active = bool(run and run.task and not run.task.done())
-        owner = owner or (run.owner if run else None)
-        if owner:
-            from src.tool_result_store import fence_results
-            fence_results(owner, session_id)
-            key = (owner, session_id)
-            _DELETIONS.setdefault(key, [not active, False])
-            if active:
-                run.deleted_scope = key
-        if active:
-            stop(session_id, run.run_id)
-        return bool(owner)
+def request_finish(session_id: str, expected_run_id: Optional[str] = None) -> bool:
+    """Ask the exact active run to finish after its completed editor work."""
+    run = _RUNS.get(session_id)
+    if not expected_run_id or run is None or run.run_id != expected_run_id:
+        return False
+    if run.status != "running" or not run.task or run.task.done():
+        return False
+    run.finish_requested = True
+    run.finish_event.set()
+    return True
 
 
-def _session_deletion_pending(session_id: str) -> bool:
-    return any(deleted_sid == session_id for _owner, deleted_sid in _DELETIONS)
+def should_finish(session_id: str) -> bool:
+    run = _RUNS.get(session_id)
+    return bool(run and run.status == "running" and run.finish_requested)
 
 
-def _finish_deletion_scope(owner: str, session_id: str, *, run_done=False, cleanup_done=False) -> None:
-    key = (owner, session_id)
-    with _RUN_LOCK:
-        state = _DELETIONS.get(key)
-        if state is None:
-            return
-        state[0] = state[0] or run_done
-        state[1] = state[1] or cleanup_done
-        if all(state):
-            _DELETIONS.pop(key, None)
-            from src.tool_result_store import release_results_fence
-            release_results_fence(owner, session_id)
-
-
-def _mark_deleted_run_drained(owner: str, session_id: str) -> None:
-    _finish_deletion_scope(owner, session_id, run_done=True)
-
-
-def complete_session_deletion(owner: Optional[str], session_id: str) -> None:
-    """Release deletion fence after DB and private-context cleanup finish."""
-    if owner:
-        _finish_deletion_scope(owner, session_id, cleanup_done=True)
-
-
-def ensure_session_reusable(session_id: str) -> None:
-    """Do not let an explicit ID reuse race a canceled run's final writes."""
-    with _RUN_LOCK:
-        run = _RUNS.get(session_id)
-        if (_session_deletion_pending(session_id)
-                or (run is not None and run.task is not None and not run.task.done())):
-            raise ValueError("session ID is still draining a previous run")
-
-
-def get_checkpoint(session_id: str, owner: Optional[str] = None) -> Optional[dict]:
-    """Read durable state for a session, scoped to its authenticated owner."""
-    return run_checkpoints.get_checkpoint(session_id, owner)
-
-
-def claim_recovery(session_id: str, owner: Optional[str], run_id: str) -> Optional[dict]:
-    """Claim an interrupted checkpoint once; this never replays tool calls."""
-    return run_checkpoints.claim_recovery(session_id, owner, run_id)
-
-
-def delete_checkpoints(session_id: str, owner: Optional[str] = None) -> None:
-    """Delete durable metadata when an owning session is permanently removed."""
-    run_checkpoints.delete_session(session_id, owner)
-    run_evidence.delete_session(session_id, owner)
+def get_finish_event(session_id: str) -> Optional[asyncio.Event]:
+    run = _RUNS.get(session_id)
+    return run.finish_event if run and run.status == "running" else None
