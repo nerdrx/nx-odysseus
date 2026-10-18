@@ -30,10 +30,7 @@ jobs:
   dependency-review:
     name: dependency-review (PR gate)
     # Only meaningful on a pull request -- it needs a base..head diff to review.
-    # dependency-review-action requires GitHub dependency-review support.
-    # Keep the blocking gate on the canonical repository; forks and maintainer
-    # preview mirrors still run the advisory pip-audit job below.
-    if: github.event_name == 'pull_request' && github.repository == 'odysseus-dev/odysseus'
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       contents: read
